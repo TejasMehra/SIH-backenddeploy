@@ -3,4 +3,4 @@ uvicorn[standard]==0.22.0
 pillow==10.0.0
 numpy==1.26.4
 transformers>=4.30.0
-torch
+# torch is big and platform-specific; install the CPU wheel below in the commands.

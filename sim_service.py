@@ -1,13 +1,26 @@
-# sim_service.py
-# FastAPI service that computes image<->text similarity using CLIP.
-# POST /analyze accepts multipart form fields:
-#   - image: file
-#   - description: text
-#
-# Returns JSON with similarity_confidence (0..1) and verdict.
+"""
+sim_service.py — Local FastAPI service for image <-> description similarity.
+
+Usage (local):
+  1. Create venv and install deps (see README commands below).
+  2. Run:
+       uvicorn sim_service:app --host 127.0.0.1 --port 8000 --reload
+
+Endpoint:
+  POST /analyze
+    - multipart form fields:
+        * description (text)
+        * image (file)
+    - returns JSON:
+        { "similarity_confidence": 0.73, "verdict": "RELATED", "details": {...} }
+
+Behavior:
+  - Attempts to use Hugging Face CLIP (transformers + torch). If unavailable, falls
+    back to a small color-histogram heuristic so the API still works.
+  - Loads the CLIP model lazily on the first request to reduce startup time.
+"""
 
 import io
-import os
 import traceback
 from typing import Optional
 
@@ -15,9 +28,9 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="sim-service", version="1.0")
+app = FastAPI(title="sim-service-local", version="1.0")
 
-# Allow CORS from anywhere by default (adjust for production)
+# Allow local testing from browsers/tools
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,48 +38,48 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load model lazily on first request to reduce startup time for lightweight deploys
+# Model globals (loaded lazily)
 MODEL = None
 PROCESSOR = None
 DEVICE = "cpu"
-MODEL_NAME = os.environ.get("CLIP_MODEL", "openai/clip-vit-base-patch32")
+MODEL_NAME = "openai/clip-vit-base-patch32"
 
 def load_clip_model():
+    """Lazy-load CLIP model (transformers). If import or load fails, MODEL stays None."""
     global MODEL, PROCESSOR, DEVICE
     if MODEL is not None:
         return
     try:
-        import torch
-        from transformers import CLIPProcessor, CLIPModel
+        import torch   # type: ignore
+        from transformers import CLIPProcessor, CLIPModel  # type: ignore
     except Exception as e:
-        # we'll fall back later
-        print("CLIP imports failed:", e)
+        print("CLIP imports failed (transformers/torch missing?):", e)
         MODEL = None
         PROCESSOR = None
         return
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading CLIP model {MODEL_NAME} on {DEVICE} ...")
+    print(f"Loading CLIP model {MODEL_NAME} on {DEVICE} ... (this may take a while)")
     MODEL = CLIPModel.from_pretrained(MODEL_NAME)
     PROCESSOR = CLIPProcessor.from_pretrained(MODEL_NAME)
     MODEL.to(DEVICE)
-    print("Model loaded.")
+    print("CLIP model loaded.")
 
 def compute_clip_similarity_bytes(image_bytes: bytes, text: str):
     """
-    Returns confidence in [0,1] and details dict.
+    Use CLIP model to compute similarity.
+    Returns: (confidence_in_0_1, details_dict)
     """
     try:
-        import torch
-        from PIL import Image
+        import torch   # type: ignore
+        from PIL import Image  # type: ignore
         from io import BytesIO
     except Exception as e:
-        raise RuntimeError("Missing runtime dependencies for CLIP: " + str(e))
+        raise RuntimeError("Missing runtime deps for CLIP: " + str(e))
 
-    # Ensure model is loaded
     load_clip_model()
     if MODEL is None or PROCESSOR is None:
-        raise RuntimeError("CLIP model not available on this server.")
+        raise RuntimeError("CLIP model not available on this server (failed to import or load).")
 
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -74,7 +87,6 @@ def compute_clip_similarity_bytes(image_bytes: bytes, text: str):
     with torch.no_grad():
         img_emb = MODEL.get_image_features(**{k:inputs[k] for k in ["pixel_values"]})
         txt_emb = MODEL.get_text_features(**{k:inputs[k] for k in ["input_ids", "attention_mask"]})
-    # normalize and compute cosine
     img_emb = img_emb / img_emb.norm(p=2, dim=-1, keepdim=True)
     txt_emb = txt_emb / txt_emb.norm(p=2, dim=-1, keepdim=True)
     sim = (img_emb @ txt_emb.T).cpu().numpy()[0][0]  # -1..1
@@ -82,7 +94,7 @@ def compute_clip_similarity_bytes(image_bytes: bytes, text: str):
     return conf, {"cosine_raw": float(sim)}
 
 def fallback_similarity_bytes(image_bytes: bytes, text: str):
-    # trivial color-histogram fallback used when CLIP not installed
+    """Simple histogram/color heuristic fallback (works without torch/transformers)."""
     try:
         from PIL import Image
         import numpy as np
@@ -107,43 +119,32 @@ def fallback_similarity_bytes(image_bytes: bytes, text: str):
 @app.post("/analyze")
 async def analyze(image: UploadFile = File(...), description: str = Form(...)):
     """
-    Analyzes the image against the given description and returns similarity.
+    Analyze an image vs a description. Returns similarity confidence (0..1).
     """
-    # Basic input checks
     if not description or description.strip() == "":
         raise HTTPException(status_code=400, detail="description is required")
     if image.content_type.split("/")[0] != "image":
         raise HTTPException(status_code=400, detail="uploaded file must be an image")
 
-    # Read image bytes (limit size to avoid memory blowups)
     data = await image.read()
-    max_bytes = int(os.environ.get("MAX_UPLOAD_BYTES", 5 * 1024 * 1024))  # default 5MB
+    max_bytes = 10 * 1024 * 1024  # 10 MB default local limit
     if len(data) > max_bytes:
         raise HTTPException(status_code=413, detail=f"image too large (max {max_bytes} bytes)")
 
-    # Attempt CLIP similarity, otherwise fallback
+    # Try CLIP
     try:
         conf, details = compute_clip_similarity_bytes(data, description)
         verdict = "RELATED" if conf >= 0.55 else ("POSSIBLY_RELATED" if conf >= 0.45 else "NOT_RELATED")
-        return JSONResponse({
-            "similarity_confidence": round(conf, 4),
-            "verdict": verdict,
-            "details": details
-        })
+        return JSONResponse({"similarity_confidence": round(conf, 4), "verdict": verdict, "details": details})
     except Exception as e:
         # fallback
         tb = traceback.format_exc()
-        print("CLIP failed or not available:", str(e))
+        print("CLIP not available or failed:", e)
         print(tb)
         conf, details = fallback_similarity_bytes(data, description)
         verdict = "RELATED" if conf >= 0.55 else ("POSSIBLY_RELATED" if conf >= 0.45 else "NOT_RELATED")
-        return JSONResponse({
-            "similarity_confidence": round(conf, 4),
-            "verdict": verdict,
-            "details": details,
-            "note": "Used fallback heuristic because CLIP was not available or failed."
-        })
+        return JSONResponse({"similarity_confidence": round(conf, 4), "verdict": verdict, "details": details, "note": "Used fallback heuristic because CLIP not available."})
 
 @app.get("/")
 def health():
-    return {"status": "ok", "model": ("loaded" if MODEL is not None else "not-loaded")}
+    return {"status": "ok", "model_loaded": MODEL is not None}
